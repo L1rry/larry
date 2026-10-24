@@ -11,3 +11,5 @@ __pycache__/
 *.jsonl
 *.old
 *_old*
+*.log
+*.log.*

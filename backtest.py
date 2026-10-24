@@ -1,3 +1,5 @@
+import time
+
 import ccxt
 import pandas as pd
 import numpy as np
@@ -26,10 +28,21 @@ TAKER_FEE_PERCENT = 0.1  # комиссия за сторону сделки
 INITIAL_CAPITAL = 1000
 
 
+def fetch_ohlcv_with_retry(exchange, symbol, timeframe, since_ms, limit, attempts=5):
+    # биржи периодически отвечают временной ошибкой посреди длинной загрузки истории
+    for attempt in range(1, attempts + 1):
+        try:
+            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        except (ccxt.NetworkError, ccxt.ExchangeError):
+            if attempt == attempts:
+                raise
+            time.sleep(2 * attempt)
+
+
 def fetch_ohlcv_full(exchange, symbol, timeframe, since_ms, limit=1000):
     all_candles = []
     while True:
-        candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        candles = fetch_ohlcv_with_retry(exchange, symbol, timeframe, since_ms, limit)
         if not candles:
             break
         all_candles += candles
@@ -475,16 +488,300 @@ def test_mean_reversion_minute():
         r = backtest_mean_reversion(df)
         buy_hold = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100
 
-        # средняя длительность сделки в минутах — пересчитаем отдельно, т.к. backtest_mean_reversion
-        # не возвращает entry/exit даты наружу
         print(f"{symbol:10s} свечей={len(df):>6d}  сделок={r['trades']:>4d}  win={r['win_rate']:>5.1f}%  "
               f"PF={r['profit_factor']:>5.2f}  доходность={r['total_return_pct']:>+7.2f}%  "
               f"просадка={r['max_drawdown_pct']:>6.2f}%  buy&hold(14д)={buy_hold:>+7.2f}%")
 
 
+def backtest_trailing_stop(df, trail_mult=None, fast=FAST_MA, slow=SLOW_MA,
+                           fee_percent=TAKER_FEE_PERCENT, atr_multiplier=ATR_MULTIPLIER,
+                           wait_new_cross=False):
+    """trail_mult=None — стоп стоит на месте (текущая стратегия); иначе стоп подтягивается
+    за максимумом цены с момента входа на расстоянии trail_mult * ATR и никогда не опускается.
+    wait_new_cross=True — после выхода по стопу не входить снова, пока MA не развернутся вниз
+    и обратно вверх (иначе бот заходит на следующий же день, пока тренд формально жив)."""
+    df = add_atr(df.copy())
+    df["fast_ma"] = df["close"].rolling(fast).mean()
+    df["slow_ma"] = df["close"].rolling(slow).mean()
+    df["position"] = (df["fast_ma"] > df["slow_ma"]).astype(int).shift(1).fillna(0)
+
+    trades = []
+    in_position = False
+    blocked = False
+    entry_price = stop_price = peak_high = None
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        if row["position"] == 0:
+            blocked = False
+        if in_position:
+            # стоп на этот бар посчитан по данным до вчерашнего дня включительно — без подглядывания
+            exit_price = None
+            if row["low"] <= stop_price:
+                exit_price, reason = stop_price, "stop"
+            elif row["position"] == 0:
+                exit_price, reason = row["close"], "ma_cross"
+            if exit_price is not None:
+                exit_net = exit_price * (1 - fee_percent / 100)
+                trades.append({
+                    "pnl": (exit_net - entry_price) / entry_price * 100,
+                    "peak": (peak_high - entry_price) / entry_price * 100,
+                    "reason": reason,
+                })
+                in_position = False
+                blocked = wait_new_cross and reason == "stop"
+                continue
+            peak_high = max(peak_high, row["high"])
+            if trail_mult and pd.notna(row["atr"]):
+                stop_price = max(stop_price, peak_high - trail_mult * row["atr"])
+
+        if not in_position and not blocked and row["position"] == 1 and pd.notna(row["atr"]):
+            entry_price = row["close"] * (1 + fee_percent / 100)
+            stop_price = row["close"] - atr_multiplier * row["atr"]
+            peak_high = row["close"]
+            in_position = True
+
+    if in_position:
+        last = df.iloc[-1]
+        exit_net = last["close"] * (1 - fee_percent / 100)
+        trades.append({
+            "pnl": (exit_net - entry_price) / entry_price * 100,
+            "peak": (peak_high - entry_price) / entry_price * 100,
+            "reason": "open_at_end",
+        })
+
+    equity = INITIAL_CAPITAL
+    peak_equity = equity
+    max_drawdown = 0
+    for t in trades:
+        equity *= (1 + t["pnl"] / 100)
+        peak_equity = max(peak_equity, equity)
+        max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity * 100)
+
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    big = [t for t in trades if t["peak"] >= 10]
+
+    return {
+        "trades": len(trades),
+        "win_rate": len(wins) / len(trades) * 100 if trades else 0,
+        "profit_factor": sum(t["pnl"] for t in wins) / gross_loss if gross_loss else float("inf"),
+        "total_return_pct": (equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100,
+        "max_drawdown_pct": max_drawdown,
+        "big_trades": len(big),
+        "avg_giveback": sum(t["peak"] - t["pnl"] for t in big) / len(big) if big else 0,
+        "avg_final_big": sum(t["pnl"] for t in big) / len(big) if big else 0,
+    }
+
+
+def test_trailing_stop():
+    exchange = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
+    final_symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "TRX/USDT"]
+    variants = [(None, "стоп на месте"), (2, "трейл 2 ATR"), (3, "трейл 3 ATR"), (4, "трейл 4 ATR")]
+
+    print(f"\nMA {FAST_MA}/{SLOW_MA}, начальный стоп {ATR_MULTIPLIER} ATR от входа; ~{LOOKBACK_DAYS} дней истории")
+    print("'Отдача' и 'итог' — среднее по сделкам, которые хоть раз были в плюсе на 10%+\n")
+
+    data = {symbol: load_price_data(exchange, symbol) for symbol in final_symbols}
+    modes = [(False, "повторный вход сразу"), (True, "после стопа ждать новый сигнал")]
+
+    for wait, mode_label in modes:
+        print(f"##### Режим: {mode_label} #####\n")
+        totals = {label: {"ret": [], "dd": [], "gb": []} for _, label in variants}
+        for symbol in final_symbols:
+            print(f"=== {symbol} ===")
+            print(f"  {'вариант':15s} {'сделок':>6s} {'win%':>6s} {'PF':>5s} {'доходн.':>9s} {'просадка':>9s} "
+                  f"{'сделок 10%+':>11s} {'отдача':>8s} {'итог':>7s}")
+            for trail, label in variants:
+                r = backtest_trailing_stop(data[symbol], trail_mult=trail, wait_new_cross=wait)
+                totals[label]["ret"].append(r["total_return_pct"])
+                totals[label]["dd"].append(r["max_drawdown_pct"])
+                totals[label]["gb"].append(r["avg_giveback"])
+                print(f"  {label:15s} {r['trades']:>6d} {r['win_rate']:>5.1f}% {r['profit_factor']:>5.2f} "
+                      f"{r['total_return_pct']:>+8.1f}% {r['max_drawdown_pct']:>8.1f}% "
+                      f"{r['big_trades']:>11d} {r['avg_giveback']:>6.1f}пп {r['avg_final_big']:>+6.1f}%")
+            print()
+
+        print(f"Среднее по 4 монетам ({mode_label}):")
+        for _, label in variants:
+            t = totals[label]
+            n = len(t["ret"])
+            print(f"  {label:15s} доходность {sum(t['ret']) / n:+7.1f}%   просадка {sum(t['dd']) / n:5.1f}%   "
+                  f"отдача от пика {sum(t['gb']) / n:5.1f}пп")
+        print()
+
+
+INTRADAY_LOOKBACK_DAYS = 90
+
+
+def test_15m():
+    exchange = ccxt.bybit({"enableRateLimit": True})
+    symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "TRX/USDT", "DOGE/USDT", "XRP/USDT", "ADA/USDT"]
+
+    print(f"\n15-минутные свечи, Bybit, последние {INTRADAY_LOOKBACK_DAYS} дней, комиссия {TAKER_FEE_PERCENT}%/сторону")
+    print(f"Тренд = MA {FAST_MA}/{SLOW_MA} + стоп {ATR_MULTIPLIER} ATR + ждать новый сигнал после стопа (как в боте)")
+    print(f"MR = mean-reversion: вход ниже Боллинджера ({BB_PERIOD}, {BB_STD_MULTIPLIER}σ), выход у средней, стоп {ATR_MULTIPLIER} ATR\n")
+    print(f"{'Монета':10s} {'страт.':6s} {'сделок':>6s} {'win%':>6s} {'PF':>5s} {'доходн.':>9s} "
+          f"{'без комис.':>10s} {'просадка':>9s} {'buy&hold':>9s}")
+
+    summary = {"Тренд": [], "MR": []}
+    for symbol in symbols:
+        since_ms = exchange.milliseconds() - INTRADAY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+        candles = fetch_ohlcv_full(exchange, symbol, "15m", since_ms)
+        df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms")
+        buy_hold = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100
+
+        results = [
+            ("Тренд", backtest_trailing_stop(df, wait_new_cross=True),
+             backtest_trailing_stop(df, wait_new_cross=True, fee_percent=0)),
+            ("MR", backtest_mean_reversion(df), backtest_mean_reversion(df, fee_percent=0)),
+        ]
+        for name, r, gross in results:
+            summary[name].append((r["total_return_pct"], gross["total_return_pct"], buy_hold))
+            print(f"{symbol:10s} {name:6s} {r['trades']:>6d} {r['win_rate']:>5.1f}% {r['profit_factor']:>5.2f} "
+                  f"{r['total_return_pct']:>+8.1f}% {gross['total_return_pct']:>+9.1f}% "
+                  f"{r['max_drawdown_pct']:>8.1f}% {buy_hold:>+8.1f}%")
+        print()
+
+    print("Среднее по монетам:")
+    for name, vals in summary.items():
+        n = len(vals)
+        print(f"  {name:6s} с комиссией {sum(v[0] for v in vals) / n:+7.1f}%   "
+              f"без комиссии {sum(v[1] for v in vals) / n:+7.1f}%   buy&hold {sum(v[2] for v in vals) / n:+7.1f}%")
+
+
+BREAKOUT_LOOKBACK_DAYS = 180
+BREAKOUT_RR = 2.0
+
+
+def backtest_breakout_retest(df5, rr=BREAKOUT_RR, fee_percent=TAKER_FEE_PERCENT, allow_short=True):
+    """Пробой и ретест уровней вчерашнего дня (стратегия из видео КриптоБош).
+    Пробой — закрытие 15-минутной свечи за вчерашним максимумом/минимумом; вход — 5-минутная
+    свеча коснулась пробитого уровня и закрылась за ним; стоп за свечой ретеста, тейк = rr * риск,
+    иначе выход в конце дня. Не больше одного лонга и одного шорта в день."""
+    df5 = df5.copy()
+    df5["day"] = df5["date"].dt.floor("D")
+    daily = df5.groupby("day").agg(high=("high", "max"), low=("low", "min"))
+    prev_levels = daily.shift(1)
+
+    trades = []
+    for day, g in df5.groupby("day"):
+        pdh, pdl = prev_levels.loc[day, "high"], prev_levels.loc[day, "low"]
+        if pd.isna(pdh):
+            continue
+        long_broken = short_broken = traded_long = traded_short = False
+        pos = None
+        bars = list(g.itertuples())
+        for j, r in enumerate(bars):
+            if pos:
+                exit_price = None
+                if pos["side"] == "long":
+                    if r.low <= pos["stop"]:
+                        exit_price = pos["stop"]
+                    elif r.high >= pos["target"]:
+                        exit_price = pos["target"]
+                else:
+                    if r.high >= pos["stop"]:
+                        exit_price = pos["stop"]
+                    elif r.low <= pos["target"]:
+                        exit_price = pos["target"]
+                if exit_price is None and j == len(bars) - 1:
+                    exit_price = r.close
+                if exit_price is not None:
+                    trades.append(_close_breakout_trade(pos, exit_price, fee_percent))
+                    pos = None
+                continue
+
+            # 5-минутная свеча, начавшаяся в :10, :25, :40, :55, закрывает 15-минутную
+            if (r.date.minute + 5) % 15 == 0:
+                if r.close > pdh:
+                    long_broken = True
+                if r.close < pdl:
+                    short_broken = True
+
+            if long_broken and not traded_long and r.low <= pdh < r.close and j < len(bars) - 1:
+                risk = r.close - r.low
+                if risk > 0:
+                    pos = {"side": "long", "entry": r.close, "stop": r.low, "target": r.close + rr * risk}
+                    traded_long = True
+            elif (allow_short and short_broken and not traded_short
+                  and r.high >= pdl > r.close and j < len(bars) - 1):
+                risk = r.high - r.close
+                if risk > 0:
+                    pos = {"side": "short", "entry": r.close, "stop": r.high, "target": r.close - rr * risk}
+                    traded_short = True
+
+    equity = INITIAL_CAPITAL
+    peak = equity
+    max_dd = 0
+    for t in trades:
+        equity *= 1 + t / 100
+        peak = max(peak, equity)
+        max_dd = max(max_dd, (peak - equity) / peak * 100)
+    wins = [t for t in trades if t > 0]
+    gross_loss = abs(sum(t for t in trades if t <= 0))
+    return {
+        "trades": len(trades),
+        "win_rate": len(wins) / len(trades) * 100 if trades else 0,
+        "profit_factor": sum(wins) / gross_loss if gross_loss else float("inf"),
+        "total_return_pct": (equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100,
+        "max_drawdown_pct": max_dd,
+    }
+
+
+def _close_breakout_trade(pos, exit_price, fee_percent):
+    fee = fee_percent / 100
+    if pos["side"] == "long":
+        entry_eff, exit_eff = pos["entry"] * (1 + fee), exit_price * (1 - fee)
+        return (exit_eff - entry_eff) / entry_eff * 100
+    entry_eff, exit_eff = pos["entry"] * (1 - fee), exit_price * (1 + fee)
+    return (entry_eff - exit_eff) / entry_eff * 100
+
+
+def test_breakout_retest():
+    exchange = ccxt.bybit({"enableRateLimit": True})
+    symbols = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "TRX/USDT", "DOGE/USDT", "XRP/USDT", "ADA/USDT"]
+    variants = [(False, "только лонг"), (True, "лонг+шорт")]
+
+    print(f"\nПробой и ретест уровней вчерашнего дня: 5-мин свечи Bybit, {BREAKOUT_LOOKBACK_DAYS} дней, "
+          f"тейк {BREAKOUT_RR:.0f}R, комиссия {TAKER_FEE_PERCENT}%/сторону\n")
+    print(f"{'Монета':10s} {'вариант':12s} {'сделок':>6s} {'win%':>6s} {'PF':>5s} {'доходн.':>9s} "
+          f"{'без комис.':>10s} {'просадка':>9s} {'buy&hold':>9s}")
+
+    summary = {label: [] for _, label in variants}
+    for symbol in symbols:
+        since_ms = exchange.milliseconds() - BREAKOUT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000
+        candles = fetch_ohlcv_full(exchange, symbol, "5m", since_ms)
+        df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms")
+        buy_hold = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100
+
+        for allow_short, label in variants:
+            r = backtest_breakout_retest(df, allow_short=allow_short)
+            gross = backtest_breakout_retest(df, allow_short=allow_short, fee_percent=0)
+            summary[label].append((r["total_return_pct"], gross["total_return_pct"], r["win_rate"], buy_hold))
+            print(f"{symbol:10s} {label:12s} {r['trades']:>6d} {r['win_rate']:>5.1f}% {r['profit_factor']:>5.2f} "
+                  f"{r['total_return_pct']:>+8.1f}% {gross['total_return_pct']:>+9.1f}% "
+                  f"{r['max_drawdown_pct']:>8.1f}% {buy_hold:>+8.1f}%")
+        print()
+
+    print("Среднее по монетам:")
+    for label, vals in summary.items():
+        n = len(vals)
+        print(f"  {label:12s} с комиссией {sum(v[0] for v in vals) / n:+7.1f}%   без комиссии "
+              f"{sum(v[1] for v in vals) / n:+7.1f}%   win {sum(v[2] for v in vals) / n:5.1f}%   "
+              f"buy&hold {sum(v[3] for v in vals) / n:+7.1f}%")
+
+
 if __name__ == "__main__":
     import sys
-    if "--tp" in sys.argv:
+    if "--bo" in sys.argv:
+        test_breakout_retest()
+    elif "--15m" in sys.argv:
+        test_15m()
+    elif "--tp" in sys.argv:
         test_take_profit()
     elif "--short" in sys.argv:
         test_long_short()
@@ -492,5 +789,7 @@ if __name__ == "__main__":
         test_mean_reversion()
     elif "--mr1m" in sys.argv:
         test_mean_reversion_minute()
+    elif "--trail" in sys.argv:
+        test_trailing_stop()
     else:
         main()

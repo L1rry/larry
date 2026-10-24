@@ -3,7 +3,10 @@ import ccxt
 import json
 import logging
 import os
-from datetime import datetime, time as dtime, timezone
+import socket
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -112,7 +115,14 @@ EXCHANGE_URLS = {
 
 # ─────────────────────────────────────────────────────────
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=2, encoding="utf-8")],
+)
+# httpx логирует каждый запрос к Telegram вместе с токеном бота в URL
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("arbi-bot")
 
 pending_trades = {}
@@ -268,7 +278,7 @@ def log_paper_trade(symbol, side, info):
         logger.warning(f"Не удалось записать бумажную сделку в лог: {e}")
 
 
-def compute_paper_stats():
+def compute_paper_stats(instances=None):
     if not os.path.exists(PAPER_TRADES_LOG_PATH):
         return None
     closed_trades = []
@@ -285,32 +295,46 @@ def compute_paper_stats():
                 closed_trades.append(entry)
 
     paper_portfolio = load_json(PAPER_STATE_PATH, {})
+    trend_state = load_json(TREND_STATE_PATH, {})
+    exchange = instances.get(TREND_EXCHANGE_ID) if instances else None
     total_equity = 0.0
+    positions = []
     for symbol in TREND_SYMBOLS:
         state = paper_portfolio.get(symbol, {"cash": PAPER_INITIAL_CAPITAL_PER_SYMBOL, "coin_qty": 0.0})
         if state["coin_qty"] > 0 and state.get("avg_entry_price"):
-            # незакрытую позицию считаем по цене входа (последняя известная цена не всегда под рукой)
-            total_equity += state["coin_qty"] * state["avg_entry_price"]
+            # незакрытую позицию оцениваем по текущей рыночной цене, а не по цене
+            # входа — иначе нереализованный P&L всегда показывал бы 0%
+            entry = state["avg_entry_price"]
+            price = entry
+            if exchange:
+                try:
+                    ticker = exchange.fetch_ticker(symbol)
+                    if ticker and ticker.get("last"):
+                        price = ticker["last"]
+                except Exception as e:
+                    logger.warning(f"Paper stats: не удалось получить цену {symbol}: {e}")
+            total_equity += state["coin_qty"] * price
+            stop = trend_state.get(symbol, {}).get("stop_price")
+            positions.append({
+                "symbol": symbol,
+                "pnl_percent": (price - entry) / entry * 100,
+                "pnl_usdt": state["coin_qty"] * (price - entry),
+                "to_stop_percent": (price - stop) / price * 100 if stop else None,
+            })
         else:
             total_equity += state["cash"]
 
-    initial_total = PAPER_INITIAL_CAPITAL_PER_SYMBOL * len(TREND_SYMBOLS)
-
-    if not closed_trades:
-        return {
-            "closed_trades": 0,
-            "total_equity": total_equity,
-            "initial_total": initial_total,
-        }
-
-    wins = [t for t in closed_trades if t["pnl_percent"] > 0]
-    return {
+    stats = {
         "closed_trades": len(closed_trades),
-        "win_rate": len(wins) / len(closed_trades) * 100,
-        "avg_pnl_percent": sum(t["pnl_percent"] for t in closed_trades) / len(closed_trades),
         "total_equity": total_equity,
-        "initial_total": initial_total,
+        "initial_total": PAPER_INITIAL_CAPITAL_PER_SYMBOL * len(TREND_SYMBOLS),
+        "positions": positions,
     }
+    if closed_trades:
+        wins = [t for t in closed_trades if t["pnl_percent"] > 0]
+        stats["win_rate"] = len(wins) / len(closed_trades) * 100
+        stats["avg_pnl_percent"] = sum(t["pnl_percent"] for t in closed_trades) / len(closed_trades)
+    return stats
 
 
 async def handle_trend_entry(context, symbol, price, paper_portfolio, stop_price=None):
@@ -403,12 +427,17 @@ async def trend_check_job(context: ContextTypes.DEFAULT_TYPE):
             # цена может провалиться глубже, чем сам уровень стопа (проскальзывание).
             if stop_price and data["price"] <= stop_price:
                 await handle_trend_exit(context, symbol, data["price"], paper_portfolio, reason="stop_loss")
-                trend_state[symbol] = {"in_position": False}
+                # Стоп пробит — тренд сломан, даже если MA ещё смотрят вверх. Не входим снова,
+                # пока MA не развернутся вниз и обратно (бэктест: +134% против +122%, просадка ниже).
+                trend_state[symbol] = {"in_position": False, "wait_new_cross": True}
                 continue
             if data["signal"] == 0:
                 await handle_trend_exit(context, symbol, data["price"], paper_portfolio, reason="ma_cross")
                 trend_state[symbol] = {"in_position": False}
                 continue
+        elif state.get("wait_new_cross"):
+            if data["signal"] == 0:
+                trend_state[symbol] = {"in_position": False}
         elif data["signal"] == 1:
             stop_price = data["price"] - TREND_ATR_MULTIPLIER * data["atr"] if data["atr"] else None
             await handle_trend_entry(context, symbol, data["price"], paper_portfolio, stop_price=stop_price)
@@ -468,19 +497,22 @@ async def volatility_check_job(context: ContextTypes.DEFAULT_TYPE):
     save_json(VOLATILITY_STATE_PATH, state)
 
 
-def format_paper_stats_text():
-    stats = compute_paper_stats()
+async def format_paper_stats_text(instances):
+    stats = await asyncio.to_thread(compute_paper_stats, instances)
     if not stats:
         return "Пока нет данных по бумажному портфелю."
 
     pnl_total = stats["total_equity"] - stats["initial_total"]
     pnl_total_percent = pnl_total / stats["initial_total"] * 100
 
-    lines = [
-        "📄 Бумажный (виртуальный) портфель тренд-стратегии",
-        f"Стартовый капитал: {stats['initial_total']:.2f} USDT",
-        f"Текущая оценка: {stats['total_equity']:.2f} USDT ({pnl_total_percent:+.2f}%)",
-    ]
+    lines = ["📄 Бумажный портфель (виртуальные деньги)", ""]
+    for p in sorted(stats["positions"], key=lambda p: -p["pnl_percent"]):
+        stop_part = f", до стопа {p['to_stop_percent']:.1f}%" if p["to_stop_percent"] is not None else ""
+        lines.append(f"{p['symbol']}: {p['pnl_percent']:+.2f}% ({p['pnl_usdt']:+.2f} USDT){stop_part}")
+    if stats["positions"]:
+        lines.append("")
+    lines.append(f"Итого: {pnl_total:+.2f} USDT ({pnl_total_percent:+.2f}%) "
+                 f"от {stats['initial_total']:.0f} USDT")
     if stats["closed_trades"]:
         lines.append(f"Закрытых сделок: {stats['closed_trades']}")
         lines.append(f"Win rate: {stats['win_rate']:.1f}%")
@@ -492,12 +524,18 @@ def format_paper_stats_text():
 
 
 async def paperstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(format_paper_stats_text())
+    text = await format_paper_stats_text(context.bot_data["instances"])
+    await update.message.reply_text(text)
 
 
-async def paper_digest_job(context: ContextTypes.DEFAULT_TYPE):
-    text = "🗓 Ежедневная сводка\n\n" + format_paper_stats_text()
-    await context.bot.send_message(chat_id=CHAT_ID, text=text)
+# Статистика в Telegram в каждый чётный час по местному времени (00:00, 02:00, ... 22:00).
+# Часовой пояс задан явно, чтобы при переходе на зимнее время расписание не сдвигалось.
+PAPER_STATS_TIMEZONE = ZoneInfo("Europe/Chisinau")
+
+
+async def paper_stats_job(context: ContextTypes.DEFAULT_TYPE):
+    stats_text = await format_paper_stats_text(context.bot_data["instances"])
+    await context.bot.send_message(chat_id=CHAT_ID, text=stats_text)
 
 
 def load_api_credentials(ex_id):
@@ -787,10 +825,26 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+SINGLE_INSTANCE_PORT = 47913
+
+
+def acquire_single_instance_lock():
+    # Две копии с одним токеном ловят 409 Conflict от Telegram — не даём стартовать второй.
+    # Порт освобождается ОС автоматически, даже если процесс упал.
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+    except OSError:
+        logger.error("Бот уже запущен — второй экземпляр не стартует")
+        raise SystemExit(0)
+    return lock
+
+
 def main():
     if not TELEGRAM_TOKEN or not CHAT_ID:
         raise RuntimeError("Не заданы TELEGRAM_TOKEN или CHAT_ID — проверь файл .env")
 
+    instance_lock = acquire_single_instance_lock()  # сокет должен жить, пока работает бот
     load_pending_state()
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -798,11 +852,17 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("paperstats", paperstats_command))
+    # По умолчанию APScheduler молча пропускает запуск, опоздавший больше чем на 1 секунду
+    # (сон ПК, нагрузка). Разрешаем запуск с любым опозданием, но пропущенные схлопываем в один.
+    job_kwargs = {"misfire_grace_time": None, "coalesce": True}
+    jq = application.job_queue
     if ENABLE_ARBITRAGE:
-        application.job_queue.run_repeating(check_prices_job, interval=POLL_INTERVAL_SECONDS, first=5)
-    application.job_queue.run_repeating(trend_check_job, interval=TREND_CHECK_INTERVAL_SECONDS, first=20)
-    application.job_queue.run_repeating(volatility_check_job, interval=VOLATILITY_CHECK_INTERVAL_SECONDS, first=30)
-    application.job_queue.run_daily(paper_digest_job, time=dtime(hour=9, minute=0, tzinfo=timezone.utc))
+        jq.run_repeating(check_prices_job, interval=POLL_INTERVAL_SECONDS, first=5, job_kwargs=job_kwargs)
+    jq.run_repeating(trend_check_job, interval=TREND_CHECK_INTERVAL_SECONDS, first=20, job_kwargs=job_kwargs)
+    jq.run_repeating(volatility_check_job, interval=VOLATILITY_CHECK_INTERVAL_SECONDS, first=30, job_kwargs=job_kwargs)
+    jq.run_custom(paper_stats_job, job_kwargs={
+        "trigger": "cron", "hour": "*/2", "minute": 0, "timezone": PAPER_STATS_TIMEZONE, **job_kwargs,
+    })
 
     mode = "LIVE (кнопка исполняет реальные сделки)" if LIVE_TRADING else "ТЕСТОВЫЙ (кнопка не исполняет по-настоящему)"
     logger.info(f"Бот запущен. Бирж: {len(application.bot_data['instances'])}, режим: {mode}")
@@ -811,4 +871,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("Бот упал с необработанной ошибкой")
+        raise
