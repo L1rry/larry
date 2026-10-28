@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 load_dotenv()
@@ -217,10 +218,53 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def sync_exchange_time(exchange):
+    # Bybit отклоняет подписанные запросы, если часы ПК расходятся с биржей больше чем на 5 с,
+    # а служба времени Windows бывает выключена. ccxt сам сверяет время только после первого
+    # подписанного запроса при загрузке рынков, поэтому делаем это заранее, перед каждой проверкой.
+    try:
+        exchange.load_time_difference()
+    except Exception as e:
+        logger.warning(f"Не удалось сверить время с {exchange.id}: {e}")
+
+
+TELEGRAM_SEND_ATTEMPTS = 3
+
+
+async def send_to_chat(context, text, reply_markup=None):
+    # Сообщение вторично: к этому моменту сделка уже записана, и сбой Telegram
+    # не должен обрывать проверку и оставлять состояние недосохранённым.
+    for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
+        try:
+            await context.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=reply_markup)
+            return True
+        except BadRequest as e:  # наследник NetworkError, но повтор тут бесполезен
+            logger.error(f"Telegram отклонил сообщение: {e}")
+            return False
+        except NetworkError as e:
+            logger.warning(f"Telegram: сбой отправки, попытка {attempt}/{TELEGRAM_SEND_ATTEMPTS}: {e}")
+            if attempt < TELEGRAM_SEND_ATTEMPTS:
+                await asyncio.sleep(10 * attempt)
+        except TelegramError as e:
+            logger.error(f"Telegram отклонил сообщение: {e}")
+            return False
+    logger.error(f"Telegram: сообщение не отправлено после {TELEGRAM_SEND_ATTEMPTS} попыток: {text[:80]!r}")
+    return False
+
+
 def compute_trend_signal(exchange, symbol, fast=TREND_FAST_MA, slow=TREND_SLOW_MA,
                           atr_period=TREND_ATR_PERIOD, timeframe=TREND_TIMEFRAME):
-    limit = max(slow, atr_period) + 5
+    limit = max(slow, atr_period) + 6
     candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    if not candles:
+        return None
+    current_price = candles[-1][4]
+
+    # Сигнал и ATR считаем только по закрытым свечам, как в бэктесте: незакрытая дневная
+    # свеча меняется весь день, и у пересечения средних сигнал прыгал бы туда-обратно.
+    # Текущая цена при этом нужна для стопа и цены сделки.
+    if candles[-1][0] + exchange.parse_timeframe(timeframe) * 1000 > exchange.milliseconds():
+        candles = candles[:-1]
     if len(candles) < slow:
         return None
 
@@ -238,7 +282,7 @@ def compute_trend_signal(exchange, symbol, fast=TREND_FAST_MA, slow=TREND_SLOW_M
         trs.append(tr)
     atr = sum(trs[-atr_period:]) / atr_period if len(trs) >= atr_period else None
 
-    return {"signal": signal, "price": closes[-1], "atr": atr}
+    return {"signal": signal, "price": current_price, "atr": atr}
 
 
 def paper_buy(paper_portfolio, symbol, price, fee_percent=DEFAULT_TAKER_FEE_PERCENT):
@@ -365,7 +409,7 @@ async def handle_trend_entry(context, symbol, price, paper_portfolio, stop_price
         InlineKeyboardButton(f"🟢 Купить (~{TREND_MAX_TRADE_USDT} USDT)", callback_data=f"buy:{trade_id}"),
         InlineKeyboardButton("❌ Пропустить", callback_data=f"skip:{trade_id}"),
     ]]
-    await context.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await send_to_chat(context, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def handle_trend_exit(context, symbol, price, paper_portfolio, reason="ma_cross"):
@@ -396,7 +440,7 @@ async def handle_trend_exit(context, symbol, price, paper_portfolio, reason="ma_
         InlineKeyboardButton("🔴 Продать", callback_data=f"sell:{trade_id}"),
         InlineKeyboardButton("❌ Пропустить", callback_data=f"skip:{trade_id}"),
     ]]
-    await context.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await send_to_chat(context, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def trend_check_job(context: ContextTypes.DEFAULT_TYPE):
@@ -404,6 +448,7 @@ async def trend_check_job(context: ContextTypes.DEFAULT_TYPE):
     exchange = instances.get(TREND_EXCHANGE_ID)
     if not exchange:
         return
+    await asyncio.to_thread(sync_exchange_time, exchange)
 
     trend_state = load_json(TREND_STATE_PATH, {})
     paper_portfolio = load_json(PAPER_STATE_PATH, {})
@@ -430,11 +475,9 @@ async def trend_check_job(context: ContextTypes.DEFAULT_TYPE):
                 # Стоп пробит — тренд сломан, даже если MA ещё смотрят вверх. Не входим снова,
                 # пока MA не развернутся вниз и обратно (бэктест: +134% против +122%, просадка ниже).
                 trend_state[symbol] = {"in_position": False, "wait_new_cross": True}
-                continue
-            if data["signal"] == 0:
+            elif data["signal"] == 0:
                 await handle_trend_exit(context, symbol, data["price"], paper_portfolio, reason="ma_cross")
                 trend_state[symbol] = {"in_position": False}
-                continue
         elif state.get("wait_new_cross"):
             if data["signal"] == 0:
                 trend_state[symbol] = {"in_position": False}
@@ -443,8 +486,10 @@ async def trend_check_job(context: ContextTypes.DEFAULT_TYPE):
             await handle_trend_entry(context, symbol, data["price"], paper_portfolio, stop_price=stop_price)
             trend_state[symbol] = {"in_position": True, "stop_price": stop_price}
 
-    save_json(TREND_STATE_PATH, trend_state)
-    save_json(PAPER_STATE_PATH, paper_portfolio)
+        # Сохраняем после каждой монеты: сделка уже записана в журнал, и если проверка
+        # оборвётся на следующей монете, при повторе она не должна исполниться второй раз.
+        save_json(TREND_STATE_PATH, trend_state)
+        save_json(PAPER_STATE_PATH, paper_portfolio)
 
 
 def compute_recent_move(exchange, symbol, timeframe=VOLATILITY_WINDOW_TIMEFRAME, candles_count=VOLATILITY_WINDOW_CANDLES):
@@ -464,6 +509,7 @@ async def volatility_check_job(context: ContextTypes.DEFAULT_TYPE):
     exchange = instances.get(TREND_EXCHANGE_ID)
     if not exchange:
         return
+    await asyncio.to_thread(sync_exchange_time, exchange)
 
     state = load_json(VOLATILITY_STATE_PATH, {})
     now = datetime.now(timezone.utc)
@@ -491,7 +537,7 @@ async def volatility_check_job(context: ContextTypes.DEFAULT_TYPE):
             f"Возможна важная новость — стоит проверить самостоятельно, "
             f"бот новости не анализирует, только резкость движения цены."
         )
-        await context.bot.send_message(chat_id=CHAT_ID, text=text)
+        await send_to_chat(context, text)
         state[symbol] = now.isoformat()
 
     save_json(VOLATILITY_STATE_PATH, state)
@@ -535,7 +581,7 @@ PAPER_STATS_TIMEZONE = ZoneInfo("Europe/Chisinau")
 
 async def paper_stats_job(context: ContextTypes.DEFAULT_TYPE):
     stats_text = await format_paper_stats_text(context.bot_data["instances"])
-    await context.bot.send_message(chat_id=CHAT_ID, text=stats_text)
+    await send_to_chat(context, stats_text)
 
 
 def load_api_credentials(ex_id):
@@ -557,7 +603,9 @@ def init_exchanges():
     for ex_id in EXCHANGES:
         try:
             exchange_class = getattr(ccxt, ex_id)
-            config = {"enableRateLimit": True}
+            # adjustForTimeDifference: ccxt сверяет время с биржей и поправляет подписанные
+            # запросы — иначе при сбитых часах Windows Bybit отклоняет их (retCode 10002)
+            config = {"enableRateLimit": True, "options": {"adjustForTimeDifference": True}}
             config.update(load_api_credentials(ex_id))
             instances[ex_id] = exchange_class(config)
         except Exception as e:
@@ -753,7 +801,7 @@ async def check_prices_job(context: ContextTypes.DEFAULT_TYPE):
             keyboard_rows.append(link_row)
 
         markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
-        await context.bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=markup)
+        await send_to_chat(context, text, reply_markup=markup)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
